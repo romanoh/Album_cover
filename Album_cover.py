@@ -278,10 +278,97 @@ class AlbumCoverFinder(QThread):
         except Exception as e:
             print(f"Error saving album cover: {str(e)}")
             return None
+
+    # Add this to the AlbumCoverFinder class
+    def embed_cover_to_files(self, cover_path, audio_files):
+        """Embed the cover image to all audio files in the list"""
+        if not cover_path or not os.path.exists(cover_path):
+            return False, "Cover file does not exist"
         
-    
+        # Read the cover image data
+        try:
+            with open(cover_path, 'rb') as f:
+                image_data = f.read()
+        except Exception as e:
+            return False, f"Failed to read cover image: {str(e)}"
+        
+        # Determine image MIME type based on file extension
+        mime_type = "image/jpeg"  # Default to JPEG
+        if cover_path.lower().endswith('.png'):
+            mime_type = "image/png"
+        
+        # Count success and failures
+        success_count = 0
+        failed_files = []
+        
+        # Process each audio file
+        for file_path in audio_files:
+            try:
+                file_lower = file_path.lower()
+                
+                if file_lower.endswith('.flac'):
+                    audio = FLAC(file_path)
+                    # Clear existing pictures
+                    audio.clear_pictures()
+                    
+                    # Create new picture
+                    picture = Picture()
+                    picture.data = image_data
+                    picture.type = 3  # Cover (front)
+                    picture.mime = mime_type
+                    picture.desc = "Cover"
+                    
+                    # Add picture to file
+                    audio.add_picture(picture)
+                    audio.save()
+                    
+                elif file_lower.endswith('.mp3'):
+                    # For MP3 files, we use ID3 tags
+                    try:
+                        audio = ID3(file_path)
+                    except:
+                        # Create ID3 tag if it doesn't exist
+                        audio = ID3()
+                    
+                    # Remove existing APIC frames (cover art)
+                    audio.delall("APIC")
+                    
+                    # Add new cover art
+                    audio["APIC"] = APIC(
+                        encoding=3,  # UTF-8
+                        mime=mime_type,
+                        type=3,  # Cover (front)
+                        desc="Cover",
+                        data=image_data
+                    )
+                    audio.save(file_path)
+                    
+                elif file_lower.endswith('.m4a'):
+                    audio = MP4(file_path)
+                    # For M4A files, cover art is stored in 'covr' atom
+                    audio['covr'] = [image_data]
+                    audio.save()
+                
+                success_count += 1
+                
+            except Exception as e:
+                print(f"Error embedding cover in {file_path}: {str(e)}")
+                failed_files.append(os.path.basename(file_path))
+        
+        # Return results
+        if failed_files:
+            return (
+                success_count > 0,
+                f"Embedded cover in {success_count} files. Failed for {len(failed_files)} files: {', '.join(failed_files[:5])}" +
+                ("..." if len(failed_files) > 5 else "")
+            )
+        else:
+            return True, f"Successfully embedded cover in all {success_count} files"
 
 
+
+
+#----------    
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -375,6 +462,9 @@ class MainWindow(QMainWindow):
         self.current_selected_item = None  # Track the currently selected item
         self.album_files = {}  # Maps item_text to the list of audio files for the album
         self.files_with_embedded = {}  # Maps item_text to files that have embedded covers
+
+        # In the MainWindow.__init__ method, add this line at the end:
+        self.add_embed_cover_button()
     
     def select_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Music Folder")
@@ -393,6 +483,7 @@ class MainWindow(QMainWindow):
         self.new_label.setText("")
         self.delete_btn.setEnabled(False)
         self.extract_btn.setEnabled(False)
+        self.embed_btn.setEnabled(False) 
         self.current_selected_item = None
         
         # Set up progress tracking
@@ -498,6 +589,9 @@ class MainWindow(QMainWindow):
                 
             # Enable delete button since we have a cover
             self.delete_btn.setEnabled(True)
+            
+            # Enable embed button since we have a cover
+            self.embed_btn.setEnabled(True)
         else:
             if has_embedded:
                 self.new_label.setText(f"NO COVER FILE BUT {len(embedded_files)} FILES HAVE EMBEDDED COVERS")
@@ -507,7 +601,8 @@ class MainWindow(QMainWindow):
                 self.cover_label.setText("No cover available")
                 self.new_label.setText("")
             self.delete_btn.setEnabled(False)
-    
+            self.embed_btn.setEnabled(False)
+        
     def extract_embedded_cover(self):
         if not self.current_selected_item:
             return
@@ -577,6 +672,7 @@ class MainWindow(QMainWindow):
                 # Update tracking
                 self.current_covers[item_text] = result_path
                 self.delete_btn.setEnabled(True)
+                self.embed_btn.setEnabled(True)
                 
                 # Update status
                 self.new_label.setText("✓ EMBEDDED COVER EXTRACTED")
@@ -628,6 +724,7 @@ class MainWindow(QMainWindow):
                 self.cover_label.setText("Cover deleted")
                 self.cover_label.setPixmap(QPixmap())
                 self.delete_btn.setEnabled(False)
+                self.embed_btn.setEnabled(False)
                 
                 # Check if still has embedded covers
                 has_embedded = False
@@ -688,14 +785,47 @@ class MainWindow(QMainWindow):
         # Count albums with embedded covers
         embedded_count = len(self.files_with_embedded)
         
-        QMessageBox.information(
-            self, 
-            "Complete", 
-            f"Found {total_count} albums\n"
-            f"Downloaded {new_count} new covers\n"
-            f"Found {embedded_count} albums with embedded covers"
-        )
-    # Add these methods to the MainWindow class:
+        # Create and show the statistics frame
+        self.show_stats_summary(total_count, new_count, embedded_count)
+
+    def show_stats_summary(self, total_count, new_count, embedded_count):
+        """Display a summary of statistics in a frame at the top of the window"""
+        # Remove existing stats frame if it exists
+        if hasattr(self, 'stats_frame') and self.stats_frame is not None:
+            self.stats_frame.deleteLater()
+        
+        # Create a new frame
+        self.stats_frame = QFrame()
+        self.stats_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        self.stats_frame.setFrameShadow(QFrame.Shadow.Raised)
+        self.stats_frame.setLineWidth(2)
+        
+        # Create layout for the frame
+        stats_layout = QHBoxLayout(self.stats_frame)
+        
+        # Create styled labels for each statistic
+        total_label = QLabel(f"Total Albums: {total_count}")
+        total_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        
+        new_label = QLabel(f"New Covers Downloaded: {new_count}")
+        new_label.setStyleSheet("font-weight: bold; font-size: 14px; color: green;")
+        
+        embedded_label = QLabel(f"Albums with Embedded Covers: {embedded_count}")
+        embedded_label.setStyleSheet("font-weight: bold; font-size: 14px; color: blue;")
+        
+        # Add labels to layout with some spacing
+        stats_layout.addWidget(total_label)
+        stats_layout.addSpacing(20)
+        stats_layout.addWidget(new_label)
+        stats_layout.addSpacing(20)
+        stats_layout.addWidget(embedded_label)
+        
+        # Find the main layout and insert the frame at the top (index 0)
+        main_layout = self.centralWidget().layout()
+        
+        # If the progress bar exists, insert after it (index 1), otherwise at the top (index 0)
+        index = 1 if self.progress_bar.isVisible() else 0
+        main_layout.insertWidget(index, self.stats_frame)
 
     def show_cover_selection(self, artist, album, folder_path, covers):
         """Show a dialog with cover options and let the user choose"""
@@ -806,7 +936,201 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Error saving album cover: {str(e)}")
             return None
+        
+    # Add this to the MainWindow class
+    def add_embed_cover_button(self):
+        """Add a button to embed cover to all files"""
+        # Create the button if it doesn't exist
+        if not hasattr(self, 'embed_btn'):
+            self.embed_btn = QPushButton("Embed Cover to All Files")
+            self.embed_btn.setEnabled(False)
+            self.embed_btn.setStyleSheet("background-color: #4CBB17; color: white;")
+            self.embed_btn.clicked.connect(self.embed_cover_to_album)
+            
+            # Find the buttons layout to add it to
+            # This assumes there's an existing layout with the extract and delete buttons
+            main_widget = self.centralWidget()
+            main_layout = main_widget.layout()
+            
+            # Find the display area layout (which contains the cover container)
+            display_area = None
+            for i in range(main_layout.count()):
+                item = main_layout.itemAt(i)
+                if item.layout() and isinstance(item.layout(), QHBoxLayout):
+                    # This is likely the display_area layout
+                    display_area = item.layout()
+                    break
+            
+            if display_area:
+                # Find the cover container and its buttons layout
+                cover_container = display_area.itemAt(1).layout()  # Second item in display_area
+                
+                # Find the buttons layout
+                buttons_layout = None
+                for i in range(cover_container.count()):
+                    item = cover_container.itemAt(i)
+                    if item.layout() and isinstance(item.layout(), QHBoxLayout):
+                        buttons_layout = item.layout()
+                        break
+                
+                # Add our button to the buttons layout
+                if buttons_layout:
+                    buttons_layout.addWidget(self.embed_btn)
 
+    # Add this to the MainWindow class too
+    def embed_cover_to_album(self):
+        """Embed the current album cover to all audio files for this album"""
+        if not self.current_selected_item:
+            return
+        
+        item_text = self.current_selected_item.text()
+        
+        # Find the cover path
+        cover_path = None
+        for key in self.current_covers:
+            if item_text in key or any(tag in key for tag in ["[NEW] ", " [NO COVER]", " [HAS EMBEDDED]"]):
+                base_text = item_text
+                for tag in ["[NEW] ", " [NO COVER]", " [HAS EMBEDDED]"]:
+                    base_text = base_text.replace(tag, "")
+                
+                if base_text in key:
+                    cover_path = self.current_covers[key]
+                    break
+        
+        if not cover_path or not os.path.exists(cover_path):
+            QMessageBox.warning(self, "Error", "No cover available to embed.")
+            return
+        
+        # Find all audio files for this album
+        album_files = []
+        base_text = item_text
+        for tag in ["[NEW] ", " [NO COVER]", " [HAS EMBEDDED]"]:
+            base_text = base_text.replace(tag, "")
+        
+        # Get the folder path from the cover path
+        folder_path = os.path.dirname(cover_path)
+        
+        # Find all audio files in the folder
+        for root, _, files in os.walk(folder_path):
+            for file in files:
+                file_lower = file.lower()
+                if file_lower.endswith(('.flac', '.mp3', '.m4a')):
+                    album_files.append(os.path.join(root, file))
+        
+        if not album_files:
+            QMessageBox.warning(self, "Error", "No audio files found for this album.")
+            return
+        
+        # Confirm with user
+        reply = QMessageBox.question(
+            self,
+            "Confirm Embedding",
+            f"This will embed the cover image into {len(album_files)} audio files. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        # Show a progress dialog
+        from PyQt6.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Embedding cover art...", "Cancel", 0, len(album_files), self)
+        progress.setWindowTitle("Embedding Covers")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+        
+        # Process files in batches to keep UI responsive
+        batch_size = 10
+        success_count = 0
+        failed_files = []
+        
+        for i in range(0, len(album_files), batch_size):
+            batch = album_files[i:i+batch_size]
+            for j, file_path in enumerate(batch):
+                if progress.wasCanceled():
+                    break
+                
+                try:
+                    file_lower = file_path.lower()
+                    
+                    if file_lower.endswith('.flac'):
+                        audio = FLAC(file_path)
+                        # Clear existing pictures
+                        audio.clear_pictures()
+                        
+                        # Create new picture
+                        picture = Picture()
+                        with open(cover_path, 'rb') as f:
+                            picture.data = f.read()
+                        picture.type = 3  # Cover (front)
+                        picture.mime = "image/jpeg" if cover_path.lower().endswith('.jpg') else "image/png"
+                        picture.desc = "Cover"
+                        
+                        # Add picture to file
+                        audio.add_picture(picture)
+                        audio.save()
+                        
+                    elif file_lower.endswith('.mp3'):
+                        # For MP3 files, we use ID3 tags
+                        try:
+                            audio = ID3(file_path)
+                        except:
+                            # Create ID3 tag if it doesn't exist
+                            audio = ID3()
+                        
+                        # Remove existing APIC frames (cover art)
+                        audio.delall("APIC")
+                        
+                        # Add new cover art
+                        with open(cover_path, 'rb') as f:
+                            image_data = f.read()
+                        audio["APIC"] = APIC(
+                            encoding=3,  # UTF-8
+                            mime="image/jpeg" if cover_path.lower().endswith('.jpg') else "image/png",
+                            type=3,  # Cover (front)
+                            desc="Cover",
+                            data=image_data
+                        )
+                        audio.save(file_path)
+                        
+                    elif file_lower.endswith('.m4a'):
+                        audio = MP4(file_path)
+                        # For M4A files, cover art is stored in 'covr' atom
+                        with open(cover_path, 'rb') as f:
+                            image_data = f.read()
+                        audio['covr'] = [image_data]
+                        audio.save()
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    print(f"Error embedding cover in {file_path}: {str(e)}")
+                    failed_files.append(os.path.basename(file_path))
+                
+                # Update progress
+                progress.setValue(i + j + 1)
+                QApplication.processEvents()
+            
+            if progress.wasCanceled():
+                break
+        
+        progress.close()
+        
+        # Show results
+        if failed_files:
+            QMessageBox.warning(
+                self,
+                "Embedding Results",
+                f"Embedded cover in {success_count} files.\n\nFailed for {len(failed_files)} files:\n" +
+                '\n'.join(failed_files[:10]) + ("\n..." if len(failed_files) > 10 else "")
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Successfully embedded cover in all {success_count} files."
+            )
 
 def main():
     parser = argparse.ArgumentParser(description="Find album covers for music folders")
